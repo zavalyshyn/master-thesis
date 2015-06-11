@@ -1,0 +1,432 @@
+#!/usr/bin/lua
+
+function sleep(n)
+        os.execute("sleep " .. tonumber(n))
+end
+
+-- Function: string:trim
+--
+-- Trim whitespace around a string
+function string:trim()
+    return self:find'^%s*$' and '' or self:match'^%s*(.*%S)'
+end
+
+-- Function: readFile
+--
+-- Reads the entire contents of a file.
+--
+-- Params:
+-- * filePath - The path to the file to read.
+--
+-- Returns:
+-- * fileContents - The contents of the file
+
+function readFile(filePath)
+    local file = io.open(filePath, "rb")
+    local content = nil
+
+    if file then
+        content = file:read("*a")
+        file:close()
+
+        if content then
+            content = content:trim()
+        end
+    end
+
+    return content
+end
+
+-- Function: executeCommand
+--
+-- Executes a shell command returning the status code
+-- and stdout.
+--
+-- Params:
+-- * command - The command to execute.
+-- * captureStdout - Whether or not to capture stdout.
+--
+-- Returns:
+-- * exitCode - The exit code of the command.
+-- * stdout - The standard output of the command (if captureStdout = true).
+
+function executeCommand(command, captureStdout)
+    if captureStdout == nil then
+        captureStdout = true
+    end
+
+    if captureStdout then
+        local stdoutFilePath = os.tmpname()
+
+        local exitCode = os.execute(string.format("%s > %s", command, stdoutFilePath))
+        local stdout = readFile(stdoutFilePath)
+        os.remove(stdoutFilePath)
+
+        return exitCode, stdout
+    else
+        return os.execute(string.format("%s",command))
+    end
+end
+
+
+-- Get node's own degree
+function myDegree()
+        local _, degree = executeCommand(string.format("uci get wibed.temp.degree"))
+        return tonumber(degree)
+end
+
+-- Get average signal strength of node's neighbors
+
+function avgSig()
+        local _, avgsig = executeCommand(string.format("uci get wibed.temp.avgsig"))
+        return tonumber(avgsig)
+end
+
+function myWeight()
+        local _, weight = executeCommand(string.format("uci get wibed.temp.weight"))
+        return tonumber(weight)
+end
+
+function getNodesMac()
+        local _, mymac = executeCommand(string.format("cat /sys/class/net/br-mgmt/address"))
+        mymac = string.upper(mymac)
+        return mymac
+end
+
+---------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
+---------------------------------------------------------------------------------------
+
+-- Recieves ALFRED message that contains specified MAC
+--
+
+function recvAlfMsg(ch, mac)
+        local msghandle = io.popen("alfred -r "..ch)
+        local msg = msghandle:read("*a")
+        local mymac = getNodesMac()
+        msghandle:close()
+        if msg then
+                msg = string.gsub( msg, "%s+$", "" ) -- remove any white space at the end
+                if ch==87 then
+                        for line in msg:gmatch("[^\r\n]+") do
+                                if string.match(line,mac) then
+                                        local twords = {}
+                                        for word in string.gmatch(line, "%S+") do
+                                                table.insert(twords,word)
+                                        end
+										local ext=string.gsub(twords[6],","," ")
+										local extarray = {}
+										for i in string.gmatch(ext,"%w+") do
+											table.insert(extarray,i)
+										end
+                                        if twords[5]~="NONE" then
+                                                local list=string.gsub(twords[5],","," ")
+                                                local listarray = {}
+                                                for ch in string.gmatch(list,"%w+") do
+                                                        table.insert(listarray,ch)
+                                                end
+                                                return listarray,extarray
+                                        else
+                                                return twords[5],extarray
+                                        end
+                                end
+                        end
+		end
+	end
+end
+
+
+
+
+function channelCheck()
+        local _, alldone = executeCommand("uci get wibed.temp.alldone")
+        local _, clhead = executeCommand("uci get wibed.temp.clhead")
+        local _,clid = executeCommand("uci get wibed.temp.clid")
+        local _,ch = executeCommand("uci get wireless.radio1.channel")
+        local degree = myDegree()
+	if clid~="0" and degree~="0" then
+		os.execute("iwinfo mgmt1 scan | grep wibed -A2 | awk '{if ($0 ~ /wibed/) pat1=$3\" \"$4; if ($0 ~ /Channel:/) pat2=$4; if ($0 ~ /Signal:/) pat3=$2}{if (pat1 || pat2 || pat3) print pat1, pat2, pat3; pat=pat3=\"\"}' | awk 'NF==4{print}{}' | sed -e 's/\"//' -e 's/-//' | awk '$4<200' | uniq > /root/neighlistCl")
+		-- If there is any other cluster using the same
+		-- channel and it's cluster ID is higher than
+		-- ours we switch to other channel
+		local fi=io.open("/root/neighlistCl","r")
+		if fi~="" and ch~="36" then
+			while true do
+				line = fi:read()
+				if line == nil then break end
+				local twords = {}
+				for word in string.gmatch(line,"%S+") do
+					table.insert(twords,word)
+				end
+				local extclweight = string.gsub(twords[2],"CL","")
+				local myclweight = string.gsub(clid,"CL","")
+				if twords[2]~=clid and twords[3]==ch and tonumber(extclweight)>tonumber(myclweight) then
+						os.execute(string.format("echo ' %s %s ' | alfred -s 89",clid,ch))
+				end
+			end
+		end
+		fi:close()
+	end
+end
+
+function arrayContains(array,element)
+        for _,value in pairs(array) do
+                if value == element then
+                        return true
+                end
+        end
+        return false
+end
+
+
+function selectChannel()
+	local _,clhead = executeCommand("uci get wibed.temp.clhead")
+	local _,members = executeCommand("uci get wibed.temp.members")
+        if clhead=="1" and members~="0" then
+		-- Check for merging nodes. We have to wait for them to
+		-- finish merging before assigning a channel
+		while true do
+			local _,alldone = executeCommand("uci get wibed.temp.alldone")
+			if alldone=="1" then
+				print("SELECTING CHANNEL FOR THE CLUSTER")
+				-- All available channels in 5GHz. No default 36 ch
+				local channels = {"40","44","48","52","56","60","64"}
+				
+				--os.execute("iwinfo mgmt1 scan | awk -v nlines=3 '/wibed/ {for (i=0; i<nlines; i++) {getline}; next} 1' | grep Channel | awk '$4<100 {print $4}' | uniq -c | sort > extchannels")
+				
+
+				print("ASKING CLUSTER MEMBERS TO REPORT CHANNELS USED BY OTHER CLUSTERS AND EXTERNAL NETWORKS")
+
+				-- Request cl members to report other clusters' and
+				-- external networks channels
+				-- Collect replies and put them in the array
+				local fi=io.open("/root/clmembers","r")
+				local clchannels={}
+				local extchannels={}
+				--local _,clid=executeCommand("uci get wibed.temp.clid")
+				--os.execute(string.format("echo '%s' | alfred -s 86",clid))
+				while true do
+					local _,clid=executeCommand("uci get wibed.temp.clid")
+					os.execute(string.format("echo '%s' | alfred -s 86",clid))
+					line = fi:read()
+					if line == nil then break end
+					local twords = {}
+					for word in string.gmatch(line, "%S+") do
+						table.insert(twords,word)
+					end
+					while true do
+						list,extlist = recvAlfMsg(87,twords[1])
+						if list then
+							if list~="NONE" then
+								for _,v in pairs(list) do
+									if not arrayContains(clchannels,v) then	
+										table.insert(clchannels,v)
+									end
+								end
+								for _,v in pairs(extlist) do
+									table.insert(extchannels,v)
+								end
+								print("RECEIVED CHANNELS FROM",twords[1])
+								os.execute("echo done | alfred -s 86")
+								break
+							else 
+								for _,v in pairs(extlist) do
+									table.insert(extchannels,v)
+								end
+								print("RECEIVED NONE CHANNELS FROM",twords[1])
+								break
+							end
+
+						else
+							sleep(2)
+						end
+					end
+				end
+				os.execute("echo done | alfred -s 86")
+				fi:close()
+				
+				print("RECEIVED CHANNELS USED BY OTHER CLUSTERS AND EXTERNAL NETWORKS")
+		
+				-- Do the same procedure myself
+				--
+				-- Checking other clusters
+				--
+				local _, clid = executeCommand("uci get wibed.temp.clid")
+				local _,chan = executeCommand(string.format("iwinfo mgmt1 scan | grep wibed -A1 | awk -v nlines=1 '/%s/ {for (i=0; i<nlines; i++) {getline}; next} 1' | grep Channel |awk '{print $4}' | uniq",clid))
+				if chan~="" then
+					chan=string.gsub(chan,"\n"," ")
+					for ch in string.gmatch(chan,"%S+") do
+						if not arrayContains(clchannels,ch) then
+							table.insert(clchannels,ch)
+						end
+					end
+				end
+
+				-- Checking external networks
+				-- 
+				local _,extr = executeCommand("iwinfo mgmt1 scan | awk -v nlines=3 '/wibed/ {for (i=0; i<nlines; i++) {getline}; next} 1' | grep Channel | awk '$4<166 {print $4}'")
+				if extr~="" then
+					extr=string.gsub(extr,"\n"," ")
+					for i in string.gmatch(extr,"%w+") do
+						table.insert(extchannels,i)
+					end
+				end
+				
+				print("HERE IS A LIST OF ALL CHANNELS USED BY EXTERNAL NETWORKS")
+				for _,value in pairs(extchannels) do print(value) end
+				print("----------------------")
+
+
+				-- Write external channels list into the file
+				--
+				local fo=io.open("/root/extchannels","w")
+				for _,v in pairs(extchannels) do
+					fo:write(v,"\n")
+				end
+				fo:close()
+				
+				-- Sort the content of the file based on the number
+				-- of SSIDs using the channel
+				--
+				os.execute("cat /root/extchannels | sort -n | uniq -c | sort > /root/temp; mv /root/temp /root/extchannels")
+
+				-- Identify free channels not used by any external network
+				-- and put them into freeext array
+				--
+				local freeext={}
+				for _,ch in pairs(channels) do
+					if not arrayContains(extchannels,ch) then
+						table.insert(freeext,ch)
+					end
+				end
+
+				print("FOUND FREE CHANNELS NOT YET USED BY EXTERNAL NETWORKS")
+				print("freeext ch")
+				for _,value in pairs(freeext) do print(value) end
+				print("----------")
+
+
+				-- Find channels that are free from other clusters (if any)
+				-- and put them in freecl array
+				--
+				local freecl = {}
+				for _,v in pairs(channels) do
+					if not arrayContains(clchannels,v) then
+						table.insert(freecl,v)
+					end
+				end
+				
+				print("FOUND FREE CHANNELS NOT USED BY OTHER CLUSTERS")
+
+				print("freecl ch")
+				for _,value in pairs(freecl) do print(value) end
+				print("---------")
+
+				-- Compare channels used by other clusters and external
+				-- networks. Select the one least used by any.
+				-- If there are no free external channels select the one
+				-- not used by neighbor nodes
+				--
+				local finalch = {}
+				if next(freeext)==nil then
+					-- External networks use all available channels
+					-- select a channel not used by neighbors
+					-- and less used by external networks
+					print("ALL CHANNELS ARE USED BY EXTERNAL NETWORKS")
+					print("SELECTING LEAST USED CHANNEL")
+					local t = readFile("/root/extchannels")
+					while true do
+						for line in t:gmatch("[^\r\n]+") do
+							local twords = {}
+							for word in string.gmatch(line, "%S+") do
+								table.insert(twords,word)
+							end
+							if twords[2]~="" and  not arrayContains(clchannels,twords[2]) then
+								table.insert(finalch,twords[2])
+								break
+							end
+						end
+						break
+					end
+
+				else
+					-- There is at least one channel not used by
+					-- external networks
+					for _,v in pairs(freeext) do
+						if arrayContains(freecl,v) then
+							table.insert(finalch,v)
+						end
+					end
+
+				end
+				
+				-- CRAZY CASE: if all the channels are used by external
+				-- networks AND by other clusters - select random channel
+				if next(finalch)==nil then
+					local length = table.getn(channels)
+					math.randomseed(os.time())
+					table.insert(finalch,channels[math.random(length)])
+				end
+					
+					
+				print("final channels available for cluster")
+				for _,value in pairs(finalch) do print(value) end
+
+				--Select a random channel from final set of available channels
+				--
+				local length = table.getn(finalch)
+				math.randomseed(os.time())
+				local fch = finalch[math.random(length)]	
+				
+				print("SELECTED CHANNEL FOR CLUSTER:",fch)
+		
+				print("SENDING CH INFO TO CLUSTER MEMBERS")
+				-- Send info about selected channel to all cluster members
+				--
+				os.execute(string.format("echo ' %s %s ' | alfred -s 88", clid,fch))
+				os.execute(string.format("uci set wireless.radio1.channel='%s';uci commit; /etc/init.d/network reload",fch))
+				break
+			else
+				print("WAITING FOR NODES TO JOIN CLUSTERS OR START THEIR OWN CLUSTER")
+				sleep(5)
+			end
+		end
+	end
+
+end
+
+-- If we receive a msg from any node of our cluster that
+-- same channel is currently used by other cluster, CH
+-- starts a process of selecting a new channel
+-- to work on
+--
+function changeChannel()
+        local _,clhead = executeCommand("uci get wibed.temp.clhead")
+        local _, msg = executeCommand("alfred -r 89")
+        local _, clid = executeCommand("uci get wibed.temp.clid")
+        --local _,ch = executeCommand("uci get wireless.radio1.channel")
+        if msg and string.match(msg,clid) and clhead=="1" then
+                msg = string.gsub(msg,"%s+$","")
+                for line in msg:gmatch("[^\r\n]+") do
+                        if string.match(line,clid) then
+                                local twords = {}
+                                for word in string.gmatch(line, "%S+") do
+                                        table.insert(twords,word)
+                                end
+				local _,ch = executeCommand("uci get wireless.radio1.channel")
+                                if twords[5]==ch then
+                                        selectChannel()
+                                end
+                        end
+                end
+        end
+end
+
+
+
+function main()
+	channelCheck()
+	changeChannel()
+end
+
+main()

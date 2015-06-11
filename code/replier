@@ -1,0 +1,418 @@
+#!/usr/bin/lua
+
+-- This script runs every 5 sec and replies to request from other nodes
+-- for example send its degree or any other information
+
+
+
+
+-- Function to check if file exists
+--
+function fileExists(name)
+   local f=io.open(name,"r")
+   if f~=nil then io.close(f) return true else return false end
+end
+
+
+function sleep(n)
+        os.execute("sleep " .. tonumber(n))
+end
+
+-- Function: string:trim
+--
+-- Trim whitespace around a string
+function string:trim()
+    return self:find'^%s*$' and '' or self:match'^%s*(.*%S)'
+end
+
+-- Function: readFile
+--
+-- Reads the entire contents of a file.
+--
+-- Params:
+-- * filePath - The path to the file to read.
+--
+-- Returns:
+-- * fileContents - The contents of the file
+
+function readFile(filePath)
+    local file = io.open(filePath, "rb")
+    local content = nil
+
+    if file then
+        content = file:read("*a")
+        file:close()
+
+        if content then
+            content = content:trim()
+        end
+    end
+
+    return content
+end
+
+
+-- Function: executeCommand
+--
+-- Executes a shell command returning the status code
+-- and stdout.
+--
+-- Params:
+-- * command - The command to execute.
+-- * captureStdout - Whether or not to capture stdout.
+--
+-- Returns:
+-- * exitCode - The exit code of the command.
+-- * stdout - The standard output of the command (if captureStdout = true).
+
+function executeCommand(command, captureStdout)
+    if captureStdout == nil then
+        captureStdout = true
+    end
+
+    if captureStdout then
+        local stdoutFilePath = os.tmpname()
+
+        local exitCode = os.execute(string.format("%s > %s", command, stdoutFilePath))
+        local stdout = readFile(stdoutFilePath)
+        os.remove(stdoutFilePath)
+
+        return exitCode, stdout
+    else
+        return os.execute(string.format("%s",command))
+    end
+end
+
+
+-- Get node's own degree
+function myDegree()
+        local _, degree = executeCommand(string.format("uci get wibed.temp.degree"))
+	return tonumber(degree)
+end
+
+-- Get average signal strength of node's neighbors
+
+function avgSig()
+        local _, avgsig = executeCommand(string.format("uci get wibed.temp.avgsig"))
+        return tonumber(avgsig)
+end
+
+function myWeight()
+	local _, weight = executeCommand(string.format("uci get wibed.temp.weight"))
+	return tonumber(weight)
+end
+
+function getNodesMac()
+	local _, mymac = executeCommand(string.format("cat /sys/class/net/br-mgmt/address"))
+	mymac = string.upper(mymac)
+	return mymac
+end
+
+
+-----------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------
+-----------------------------------------------------------------------------------------------
+
+-- Creates a neighbors list file and extracts data from it for further steps
+--
+function neighList()
+	if not fileExists("/root/neighlist") then
+		os.execute(string.format("iwinfo mgmt1 scan | grep wibed -A2 | awk '{if ($0 ~ /wibed/) pat1=$3; if ($0 ~ /Channel:/) pat2=$4; if ($0 ~ /Signal:/) pat3=$2}{if (pat1 || pat2 || pat3) print pat1, pat2, pat3; pat=pat3=\"\"}' | awk 'NF==3{print}{}' | sed -e 's/\"//' -e 's/-//' | awk '$3<60' | awk '!_[$1]++' > /root/neighlist"))
+		os.execute("sort --key=3,3 /root/neighlist -o /root/neighlist")
+		local deg = 0
+		for _ in io.lines'/root/neighlist' do
+			deg = deg + 1
+		end
+		local _, sig = executeCommand(string.format("awk '{ sum += $3 } END { if (NR > 0) print sum / NR; if (!NR) print '0' }' /root/neighlist"))
+		
+		-- Get the weight of the node (random value from 1 to 500)
+		-- needed for a case when both degree and avg signal of nodes are equal 
+		--
+		--local _, seed = executeCommand(string.format("cat /sys/devices/virtual/net/br-mgmt/statistics/rx_bytes"))
+		--math.randomseed(tonumber(seed))
+		local _,randnum = executeCommand("head /dev/urandom | tr -dc '0123456789' | head -c3")
+		math.randomseed(os.time()+randnum)
+		local weight = math.random(1,999)
+
+		os.execute(string.format("uci set wibed.temp=wibed; uci set wibed.temp.degree='%s'; uci set wibed.temp.avgsig='%s'; uci set wibed.temp.weight='%s'; uci set wibed.temp.clhead='0'; uci set wibed.temp.master='0'; uci set wibed.temp.clid='0'; uci set wibed.temp.alldone='0'; uci set wibed.temp.members='0'; uci set wibed.temp.alone='0'; uci set wibed.temp.active24='0'; uci set wibed.temp.border_node='0'; uci commit", deg, sig, weight))
+		if deg == 0 then
+			os.execute(string.format("uci set wibed.temp.clhead='1'; uci set wibed.temp.alone='1'; uci commit"))
+		end
+	end
+end
+
+-- Replies with nodes' degree, avg signal 
+-- if there is at least one request from any node
+--
+function degResponse()
+	local degree = myDegree()
+	if tonumber(degree)>0 then
+		local _, msg = executeCommand(string.format("alfred -r 80"))
+		local mac = getNodesMac()
+		if msg and string.match(msg,mac) then
+			msg = string.gsub(msg,"%s+$","") -- remove any white space at the end
+			local deg = myDegree()
+			local sig = avgSig()
+			local weight = myWeight()
+			os.execute(string.format("echo ' %s %s %s %s ' | alfred -s 81", mac, deg, sig, weight))
+		end
+	end
+end
+
+-- Accepts incoming JOIN requests from neigbors if node is a cluster head
+--
+function clusterMgmt()
+	-- Check if node is part of any cluster
+	local _, clid = executeCommand(string.format("uci get wibed.temp.clid"))
+	local degree = myDegree()
+	-- If node is CH then reply to all the incoming requests
+	if clid~="0" and tonumber(degree)>0 then
+		--
+		-- PROCESS JOIN REQUESTS
+		--
+		local _, master = executeCommand(string.format("uci get wibed.temp.master"))
+		local _, status = executeCommand(string.format("uci get wibed.temp.clhead"))
+		local _, msg = executeCommand(string.format("alfred -r 82"))
+		local mac = getNodesMac()
+		local weight = myWeight()
+		local _, members = executeCommand("uci get wibed.temp.members")
+		if msg and string.match(msg,mac) then
+			msg = string.gsub( msg, "%s+$", "" ) -- remove any white space at the end
+			for line in msg:gmatch("[^\r\n]+") do -- split msg into lines
+				if string.match(line,mac) then
+					local twords = {}
+					for word in string.gmatch(line, "%S+") do
+						table.insert(twords,word)
+					end
+					if twords[6] == mac then
+						-- IF I AM A CLUSTER HEAD
+						if status=="1" then
+							os.execute(string.format("echo ' %s ACCEPTED %s CL%s ' | alfred -s %s",mac,twords[4],weight,twords[7]))
+							
+							os.execute("uci set wibed.temp.members='1';uci commit")
+							local fo=io.open("/root/clmembers","a+")
+							fo:write(twords[4],"\n")
+							fo:close()
+							os.execute("sort -u /root/clmembers -o /root/clmembers")
+						-- IF I AM PART OF THE CLUSTER BUT NOT A HEAD OF IT
+						elseif status=="0" then
+							os.execute(string.format("echo ' %s REJECTED %s ' | alfred -s %s",mac,twords[4],twords[7]))
+						end
+					end
+				end
+			end
+		end
+		
+		--[[
+		-- PROCESS MERGE REQUESTS
+		--
+		local _,ch = executeCommand("uci get wireless.radio1.channel")
+		local _, msg2 = executeCommand(string.format("alfred -r 84"))
+		if msg2 and string.match(msg2,mac) then
+			msg2 = string.gsub(msg2,"%s+$","")
+			for line in msg2:gmatch("[^\r\n]+") do
+				if string.match(line,mac) then
+					local twords = {}
+					for word in string.gmatch(line, "%S+") do
+						table.insert(twords,word)
+					end
+					if twords[6] == mac then
+						if status=="0" then
+							os.execute(string.format("echo ' %s %s %s %s ' | alfred -s 85",twords[4],clid,master,ch))
+						elseif status=="1" and members~="0" then
+							os.execute(string.format("echo ' %s %s %s %s ' | alfred -s 85",twords[4],clid,mac,ch))
+						end
+					end
+				end
+			end
+		end
+		--]]
+ 
+		
+	end
+end
+
+function clustersCheck()
+	local _, alldone = executeCommand("uci get wibed.temp.alldone")
+	local _, clhead = executeCommand("uci get wibed.temp.clhead")
+	local _,clid = executeCommand("uci get wibed.temp.clid")
+	local _,ch = executeCommand("uci get wireless.radio1.channel")
+	local weight = myWeight()
+	local degree = myDegree()
+	if alldone=="0" and clhead=="1" then
+	--if alldone=="0" then
+		os.execute("iwinfo mgmt1 scan | grep wibed -A2 | awk '{if ($0 ~ /wibed/) pat1=$3\" \"$4; if ($0 ~ /Channel:/) pat2=$4; if ($0 ~ /Signal:/) pat3=$2}{if (pat1 || pat2 || pat3) print pat1, pat2, pat3; pat=pat3=\"\"}' | awk 'NF==4{print}{}' | sed -e 's/\"//' -e 's/-//' | awk '$4<60' | awk '!_[$1]++' > /root/neighlistCl")
+		local clcnt = 0
+		for _ in io.lines'/root/neighlistCl' do
+			clcnt = clcnt + 1
+		end
+		if clcnt==tonumber(degree) then
+			os.execute("uci set wibed.temp.alldone='1';uci commit")
+		end
+	end
+end
+
+--[[
+function clustersReady()
+	local _, alldone = executeCommand("uci get wibed.temp.alldone")
+	local _, clhead = executeCommand("uci get wibed.temp.clhead")
+	local _, ready = executeCommand("uci get wibed.temp.ready")
+	local _, members = executeCommand("uci get wibed.temp.members")
+	local degree = myDegree()
+	if alldone=="1" and ready=="0" and clhead=="1" and members=="1" then
+		os.execute("iwinfo mgmt1 scan | grep wibed -A2 | awk '{if ($0 ~ /wibed/) pat1=$3\" \"$4\" \"$5; if ($0 ~ /Channel:/) pat2=$4}{if (pat1 || pat2) print pat1, pat2; pat=pat2=\"\"}' | awk 'NF==4{print}{}' | sed -e 's/\"//' -e 's/-//' | awk '!_[$1]++' > /root/neighlistReady")
+		local clcnt = 0
+		for _ in io.lines'/root/neighlistReady' do
+			clcnt = clcnt + 1
+		end
+		if clcnt==tonumber(degree) then
+			os.execute("uci set wibed.temp.ready='1';uci commit")
+		end
+	end
+end
+--]]
+
+function scanChannels()
+	local _, clid = executeCommand("uci get wibed.temp.clid")
+	local _, clhead = executeCommand("uci get wibed.temp.clhead")
+	if clid~="0" and clhead~="1" then
+		local _, msg = executeCommand("alfred -r 86")
+		if msg and string.match(msg,clid) then
+			local mac = getNodesMac()
+			local _,ch = executeCommand(string.format("iwinfo mgmt1 scan | grep wibed -A1 | awk -v nlines=1 '/%s/ {for (i=0; i<nlines; i++) {getline}; next} 1' | grep Channel |awk '{print $4}' | uniq",clid))
+			local _,ext = executeCommand("iwinfo mgmt1 scan | awk -v nlines=3 '/wibed/ {for (i=0; i<nlines; i++) {getline}; next} 1' | grep Channel | awk '$4<166 {print $4}'")
+			ch=string.gsub(ch,"\n",",")
+			ext=string.gsub(ext,"\n",",")
+			if ch~="" then
+				--ch=string.gsub(ch,"\n",",")
+				--ext=string.gsub(ext,"\n",",")
+				os.execute(string.format("echo ' %s %s %s ' | alfred -s 87",mac,ch,ext))
+			else 
+				os.execute(string.format("echo ' %s NONE %s ' | alfred -s 87",mac,ext))
+			end
+		end
+	end
+end
+					
+function setChannel()
+        local _, clid = executeCommand("uci get wibed.temp.clid")
+	local _,curchan = executeCommand("uci get wireless.radio1.channel")
+	if clid~="0" then
+		local _, msg = executeCommand("alfred -r 88")
+		if msg and string.match(msg,clid) then
+			msg = string.gsub(msg,"%s+$","")
+			for line in msg:gmatch("[^\r\n]+") do
+				if string.match(line,clid) then
+					local twords = {}
+					for word in string.gmatch(line, "%S+") do
+						table.insert(twords,word)
+					end
+					if twords[5]~=curchan then
+						local ch = twords[5]
+						os.execute(string.format("uci set wireless.radio1.channel='%s'; uci commit; /etc/init.d/network reload",ch))
+						os.execute("echo done | alfred -s 87")
+					end
+					break
+				end
+			end
+		end
+	end
+end
+
+
+-- Function replies to all the nodes requesting info about node's current cluster ID
+--
+function clusterIdRequests()
+        local _, clid = executeCommand("uci get wibed.temp.clid")
+        local mac = getNodesMac()
+	if clid~="0" then
+	        local _, msg = executeCommand("alfred -r 90")
+        	if msg and string.match(msg,mac) then
+        		os.execute(string.format("echo ' %s %s ' | alfred -s 91",mac,clid))
+        	end
+	end
+end
+
+
+
+-- Process a command to disconnect 2.4 GHz radio if requested by Cluster Head
+--
+function disconnect24()
+	local _,gw = executeCommand("uci get wibed.management.is_gw")
+	local _,radio = executeCommand("uci get wireless.radio0.disabled")
+	local _,clid = executeCommand("uci get wibed.temp.clid")
+	local _,active24 = executeCommand("uci get wibed.temp.active24")
+	if gw~="1" and radio~="1" and clid~="0" and active24~="1" then
+		local _,msg = executeCommand("alfred -r 97")
+		local mac = getNodesMac()
+		if msg then
+			for line in msg:gmatch("[^\r\n]+") do
+				if string.match(line,clid) then
+					-- If our MAC is not mentioned in the list of "survivors"
+					-- disable radio0
+					if not string.match(line,mac) then
+						os.execute("uci set wireless.radio0.disabled='1'; uci commit;batctl if del mgmt0; /etc/init.d/network reload")
+					else
+						os.execute("uci set wibed.temp.border_node='1'; uci commit")
+					end
+					break
+				end
+			end
+		end
+	end
+end
+
+-- Enabled radio0 if asked by any cluster member
+--
+function connect24()
+	local _,radio = executeCommand("uci get wireless.radio0.disabled")
+	if radio=="1" then
+		local _,msg = executeCommand("alfred -r 101")
+		local _,clid = executeCommand("uci get wibed.temp.clid")
+		if msg and string.match(msg,clid) then
+			os.execute("uci wireless.radio0.disabled='0'; uci commit; /etc/init.d/network reload")
+			sleep(10)
+			os.execute("batctl if add mgmt0")
+		end
+	end
+end
+
+
+-- Keep radio0 enabled even if asked not to, but requested by any member of
+-- the bordering cluster
+--
+function keepActive24()
+	local _,clid = executeCommand("uci get wibed.temp.clid")
+	local mac = getNodesMac()
+	local _,alone = executeCommand("uci get wibed.temp.alone")
+	if clid~="0" then
+		local _,msg = executeCommand("alfred -r 85")
+		if msg and string.match(msg,mac) then
+			os.execute(string.format("echo ' %s ACK ' | alfred -s 98",mac))
+			os.execute("uci set wibed.temp.active24='1'")
+			if alone=="1" then
+				os.execute(string.format("echo ' %s READY ' | alfred -s 100",clid))
+			end
+		end
+	end
+end
+					
+		
+
+function main()
+	os.execute("lock -w /tmp/ca-lock; lock /tmp/ca-lock")
+	neighList()
+	degResponse()
+	clusterMgmt()
+	clustersCheck()
+	--clustersReady()
+	scanChannels()
+	setChannel()
+	clusterIdRequests()
+	disconnect24()
+	connect24()
+	keepActive24()
+	os.execute("lock -u /tmp/ca-lock")
+end
+
+main()

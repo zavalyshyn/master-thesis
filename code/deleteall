@@ -1,0 +1,105 @@
+#!/usr/bin/lua
+
+-- Function to check if file exists
+--
+function fileExists(name)
+   local f=io.open(name,"r")
+   if f~=nil then io.close(f) return true else return false end
+end
+
+function sleep(n)
+        os.execute("sleep " .. tonumber(n))
+end
+
+-- Function: string:trim
+--
+-- Trim whitespace around a string
+function string:trim()
+    return self:find'^%s*$' and '' or self:match'^%s*(.*%S)'
+end
+
+-- Function: readFile
+--
+-- Reads the entire contents of a file.
+--
+-- Params:
+-- * filePath - The path to the file to read.
+--
+-- Returns:
+-- * fileContents - The contents of the file
+
+function readFile(filePath)
+    local file = io.open(filePath, "rb")
+    local content = nil
+
+    if file then
+        content = file:read("*a")
+        file:close()
+
+        if content then
+            content = content:trim()
+        end
+    end
+
+    return content
+end
+
+-- Function: executeCommand
+--
+-- Executes a shell command returning the status code
+-- and stdout.
+--
+-- Params:
+-- * command - The command to execute.
+-- * captureStdout - Whether or not to capture stdout.
+--
+-- Returns:
+-- * exitCode - The exit code of the command.
+-- * stdout - The standard output of the command (if captureStdout = true).
+
+function executeCommand(command, captureStdout)
+    if captureStdout == nil then
+        captureStdout = true
+    end
+
+    if captureStdout then
+        local stdoutFilePath = os.tmpname()
+
+        local exitCode = os.execute(string.format("%s > %s", command, stdoutFilePath))
+        local stdout = readFile(stdoutFilePath)
+        os.remove(stdoutFilePath)
+
+        return exitCode, stdout
+    else
+        return os.execute(string.format("%s",command))
+    end
+end
+
+
+function getNodesMac()
+        local _, mymac = executeCommand(string.format("cat /sys/class/net/br-mgmt/address"))
+        mymac = string.upper(mymac)
+        return mymac
+end
+
+
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------
+
+local mac = getNodesMac()
+
+os.execute(string.format("uci set wireless.mgmt1.ssid='wibed %s'; uci set wireless.radio1.channel='36';uci commit; /etc/init.d/network reload", mac))
+
+os.execute("rm /root/neighlist /root/neighlistDeg /root/neighlistCl /root/clmembers /root/leaderslist /root/2.4clusters /root/2.4neighbors /root/extchannels /root/2.4listfull /root/2.4final")
+
+--for i=80, 91, 1 do
+--	os.execute(string.format("echo done | alfred -s %s",i))
+--end
+
+for i=96, 101, 1 do
+        os.execute(string.format("echo done | alfred -s %s",i))
+end
+
+os.execute("echo done | alfred -s 81; echo done | alfred -s 85; echo done | alfred -s 88; echo done | alfred -s 89; echo done | alfred -s 91")
+
